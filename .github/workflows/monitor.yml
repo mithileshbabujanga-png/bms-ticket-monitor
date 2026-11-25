@@ -63,6 +63,7 @@ jobs:
 
       - name: Commit state back
         if: always()
+        continue-on-error: true
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -74,8 +75,27 @@ jobs:
           git add "$STATE_FILE"
           if git diff --cached --quiet; then
             echo "No state changes to commit for ${{ matrix.movie.name }}."
-          else
-            git commit -m "chore(state): update $STATE_FILE [skip ci]"
-            git push
-            echo "State committed and pushed for ${{ matrix.movie.name }}."
+            exit 0
           fi
+
+          # Retry loop: pull-rebase-push with up to 5 attempts.
+          # Handles the race condition where parallel matrix jobs push to
+          # the same branch concurrently.
+          MAX_ATTEMPTS=5
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "Attempt $attempt of $MAX_ATTEMPTS..."
+            git commit -m "chore(state): update $STATE_FILE [skip ci]" || {
+              echo "Nothing to commit (likely already committed)."
+              exit 0
+            }
+            if git pull --rebase origin main && git push; then
+              echo "State committed and pushed for ${{ matrix.movie.name }}."
+              exit 0
+            fi
+            echo "Push failed (likely race condition with sibling job). Retrying in $attempt seconds..."
+            sleep $attempt
+            # Reset any partial state from the failed push
+            git rebase --abort 2>/dev/null || true
+          done
+          echo "WARNING: Could not push state after $MAX_ATTEMPTS attempts. The monitoring itself succeeded — only the state commit failed. Next run may re-alert."
+          exit 0
