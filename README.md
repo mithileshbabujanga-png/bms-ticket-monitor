@@ -1,4 +1,4 @@
-# BMS Ticket Monitor (Fresh Repo Edition)
+# BMS Ticket Monitor (Fresh Repo Edition) 
 
 Free, 24/7 cloud monitor that pings your Telegram the moment booking opens for **Avengers: Doomsday** and **Dune: Part Three** in Hyderabad — filtered to specific theatres and formats.
 
