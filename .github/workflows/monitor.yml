@@ -1,0 +1,82 @@
+name: Ticket Monitor
+
+on:
+  schedule:
+    # Explicit form of "every 5 minutes" — registers more reliably with
+    # GitHub's scheduler for brand-new repos than the */5 shorthand.
+    - cron: "0,5,10,15,20,25,30,35,40,45,50,55 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ticket-monitor-${{ matrix.movie.name }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        movie:
+          - name: avengers
+            label: "Avengers"
+            url_var: BMS_URL_AVENGERS
+            state_file: bms_state_avengers.json
+          - name: dune
+            label: "Dune"
+            url_var: BMS_URL_DUNE
+            state_file: bms_state_dune.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: uv sync --frozen || uv sync
+
+      - name: Run ticket monitor
+        env:
+          BMS_URL: ${{ vars[matrix.movie.url_var] }}
+          BMS_DATES: ${{ vars.BMS_DATES }}
+          BMS_TIME: ${{ vars.BMS_TIME }}
+          BMS_FILTER_GROUPS: ${{ vars.BMS_FILTER_GROUPS }}
+          BMS_MOVIE_LABEL: ${{ matrix.movie.label }}
+          BMS_STATE_FILE: ${{ matrix.movie.state_file }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
+          RESEND_TO_EMAIL: ${{ secrets.RESEND_TO_EMAIL }}
+        run: uv run main.py
+
+      - name: Commit state back
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          STATE_FILE="${{ matrix.movie.state_file }}"
+          if [ ! -f "$STATE_FILE" ]; then
+            echo "State file $STATE_FILE not found — monitor didn't produce one. Skipping commit."
+            exit 0
+          fi
+          git add "$STATE_FILE"
+          if git diff --cached --quiet; then
+            echo "No state changes to commit for ${{ matrix.movie.name }}."
+          else
+            git commit -m "chore(state): update $STATE_FILE [skip ci]"
+            git push
+            echo "State committed and pushed for ${{ matrix.movie.name }}."
+          fi
