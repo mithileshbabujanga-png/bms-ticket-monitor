@@ -47,6 +47,16 @@ CONFIG = {
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Pushover (https://pushover.net) — dedicated push notifications with
+# EMERGENCY priority that repeats every N seconds until acknowledged.
+# Great for smartwatch vibration + bypassing Do Not Disturb.
+PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")    # Application API token
+PUSHOVER_USER = os.getenv("PUSHOVER_USER", "")      # Your user key (or group key)
+# Optional: customize the emergency retry/expire values. Defaults follow
+# Pushover's min/max recommendations.
+PUSHOVER_EMERGENCY_RETRY = int(os.getenv("PUSHOVER_EMERGENCY_RETRY", "120"))   # seconds between retries
+PUSHOVER_EMERGENCY_EXPIRE = int(os.getenv("PUSHOVER_EMERGENCY_EXPIRE", "3600"))  # seconds until stop retrying
+
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_TO_EMAIL = os.getenv("RESEND_TO_EMAIL", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
@@ -539,7 +549,11 @@ def detect_changes(old_state, new_state):
 # ──────────────────────────────────────────────────────────────────────
 # TELEGRAM NOTIFICATION
 # ──────────────────────────────────────────────────────────────────────
-def send_telegram(text):
+def send_telegram(text, silent=False):
+    """Send a Telegram message.
+    silent=True sends without sound (low-priority alerts).
+    silent=False (default) sends with sound (high-priority alerts).
+    """
     token = TELEGRAM_BOT_TOKEN.strip()
     chat_id = TELEGRAM_CHAT_ID.strip()
     if not token or not chat_id:
@@ -553,16 +567,79 @@ def send_telegram(text):
                 "text": text,
                 "parse_mode": "Markdown",
                 "disable_web_page_preview": False,
+                "disable_notification": silent,
             },
             timeout=15,
         )
         if resp.status_code == 200:
-            print(f"  Telegram sent to chat {chat_id}")
+            mode = "silent" if silent else "with sound"
+            print(f"  Telegram sent to chat {chat_id} ({mode})")
             return True
         print(f"  Telegram error {resp.status_code}: {resp.text}")
         return False
     except requests.RequestException as e:
         print(f"  Telegram failed: {e}")
+        return False
+
+# ──────────────────────────────────────────────────────────────────────
+# PUSHOVER NOTIFICATION — for smartwatch vibration + emergency priority
+# ──────────────────────────────────────────────────────────────────────
+# Pushover supports 5 priority levels:
+#   -2 = lowest (no notification, just in-app)
+#   -1 = low (quiet notification, no sound)
+#    0 = normal (default notification + sound)
+#    1 = high (bypasses quiet hours, plays sound)
+#    2 = EMERGENCY (bypasses quiet hours, repeats every `retry` seconds
+#         until acknowledged, until `expire` seconds elapse)
+#
+# We use:
+#   Priority 2 (EMERGENCY) for HIGH urgency alerts (theatre unblock, new date)
+#     → Watch vibrates every 2 min until you tap "Acknowledge"
+#     → Bypasses DND, breaks through silent mode
+#   Priority 0 (normal) for LOW urgency alerts (new show, back in stock)
+#     → Single notification, normal sound, doesn't repeat
+#   Skip sending for baseline LIVE message (Telegram handles it silently)
+def send_pushover(text, priority=0, title="BMS Ticket Monitor"):
+    """Send a Pushover notification.
+    priority: -2 (lowest) to 2 (EMERGENCY).
+    For priority 2, message repeats every PUSHOVER_EMERGENCY_RETRY seconds
+    until acknowledged, up to PUSHOVER_EMERGENCY_EXPIRE seconds.
+    """
+    token = PUSHOVER_TOKEN.strip()
+    user = PUSHOVER_USER.strip()
+    if not token or not user:
+        print("  Pushover skipped — PUSHOVER_TOKEN or PUSHOVER_USER not set.")
+        return False
+    try:
+        payload = {
+            "token": token,
+            "user": user,
+            "message": text,
+            "title": title,
+            "priority": priority,
+        }
+        if priority == 2:
+            # EMERGENCY priority requires retry + expire
+            payload["retry"] = PUSHOVER_EMERGENCY_RETRY    # repeat every N sec
+            payload["expire"] = PUSHOVER_EMERGENCY_EXPIRE  # until N sec elapsed
+            payload["sound"] = "persistent"  # Loud repeating sound
+        elif priority == 1:
+            payload["sound"] = "high_priority"  # Distinct sound, no repeat
+        # priority 0 and below: use default sound
+        resp = requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data=payload,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            prio_label = {2: "EMERGENCY", 1: "high", 0: "normal",
+                          -1: "low", -2: "lowest"}.get(priority, str(priority))
+            print(f"  Pushover sent ({prio_label} priority)")
+            return True
+        print(f"  Pushover error {resp.status_code}: {resp.text}")
+        return False
+    except requests.RequestException as e:
+        print(f"  Pushover failed: {e}")
         return False
 
 # ──────────────────────────────────────────────────────────────────────
@@ -658,7 +735,13 @@ def send_email(subject, changes, shows, movie_info):
 def send_alert(movie_info, changes, shows, is_baseline=False):
     """Send alert via Telegram (and email if configured).
     is_baseline=True means this is the first-ever run; we send a
-    confirmation message instead of a 'changes detected' alert."""
+    confirmation message instead of a 'changes detected' alert.
+
+    Alert urgency determines Telegram notification behavior:
+    - HIGH urgency (theatre unblock, new date opened): sends WITH sound
+    - LOW urgency (new show, back in stock): sends SILENTLY (no sound)
+    - Baseline LIVE message: sends SILENTLY (setup confirmation)
+    """
     movie_name = movie_info.get("name", "Movie")
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
     deep_link = booking_deep_link(CONFIG["url"])
@@ -693,7 +776,10 @@ def send_alert(movie_info, changes, shows, is_baseline=False):
             f"or a theatre unblocks tickets.\n\n"
             f"👉 Current booking page: {deep_link}"
         )
-        send_telegram(tg_text)
+        # Baseline is a setup confirmation — send silently so it doesn't
+        # wake you up if you re-trigger at 3am. You'll still see it in the
+        # chat list when you check your phone.
+        send_telegram(tg_text, silent=True)
         return
 
     # Normal alert with changes — sort so THEATRE UNBLOCKED and NEW DATE
@@ -716,6 +802,7 @@ def send_alert(movie_info, changes, shows, is_baseline=False):
     change_lines = "\n".join(f"• {c}" for c in sorted_changes)
 
     # Detect if this is a high-urgency alert (theatre unblocked or new date)
+    # These get a LOUD notification sound on your phone.
     high_urgency = any(
         c.startswith("🔓 THEATRE UNBLOCKED") or c.startswith("📅 NEW DATE OPENED")
         for c in changes
@@ -732,7 +819,26 @@ def send_alert(movie_info, changes, shows, is_baseline=False):
         f"👉 *TAP TO BOOK NOW:*\n{deep_link}\n\n"
         f"🕒 Checked: {now_str}"
     )
-    send_telegram(tg_text)
+    # HIGH urgency → with sound (wake you up, get your attention)
+    # LOW urgency → silent (you'll see it when you check your phone)
+    send_telegram(tg_text, silent=not high_urgency)
+
+    # Pushover: dedicated push to phone + smartwatch
+    # HIGH urgency → EMERGENCY priority (vibrates watch, repeats every 2 min
+    #   until acknowledged, bypasses DND)
+    # LOW urgency → normal priority (single notification, no repeat)
+    pushover_title = f"{label_prefix}{movie_name} — {len(changes)} change(s)"
+    # Plain-text version of the alert (Pushover doesn't support Markdown)
+    pushover_text = (
+        f"{urgency_banner} {label_prefix}{movie_name} — {len(changes)} change(s)!\n\n"
+        f"Changes:\n{change_lines}\n\n"
+        f"Book now: {deep_link}\n\n"
+        f"Checked: {now_str}"
+    )
+    if high_urgency:
+        send_pushover(pushover_text, priority=2, title=pushover_title)
+    else:
+        send_pushover(pushover_text, priority=0, title=pushover_title)
 
     # Also send email if configured
     subject = f"BMS Alert: {movie_name} - {len(changes)} change(s)"
@@ -744,7 +850,10 @@ def send_alert(movie_info, changes, shows, is_baseline=False):
 def _notify_bms_unreachable(movie_info):
     """Sent on first run when BMS API is unreachable (e.g. 403 from
     datacenter IP). Tells the user the bot itself is working but BMS
-    is blocking, so they know it's not a setup problem."""
+    is blocking, so they know it's not a setup problem.
+
+    Sent silently (no sound) — this is informational, not actionable
+    at 3am. You'll see it when you check your phone."""
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
     deep_link = booking_deep_link(CONFIG["url"])
     tg_text = (
@@ -760,7 +869,7 @@ def _notify_bms_unreachable(movie_info):
         f"section of the setup guide.\n\n"
         f"👉 Movie page: {deep_link}"
     )
-    send_telegram(tg_text)
+    send_telegram(tg_text, silent=True)
 
 def main():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
